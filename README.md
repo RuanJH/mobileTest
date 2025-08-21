@@ -1,43 +1,12 @@
-imageAnalyzer.setAnalyzer(ContextCompat.getMainExecutor(context)) { imageProxy ->
-    val mediaImage = imageProxy.image
-    val rotationDegrees = imageProxy.imageInfo.rotationDegrees
-    if (mediaImage != null) {
-        val yuvBytes = imageProxyToNV21(imageProxy)
-        cardResult = sdkViewModel.OcrDetection(
-            context = context,
-            targetCardType = 3,
-            cardRect = RectF(cardRect.value),
-            bytes = yuvBytes,
-            imageWidth = mediaImage.width,
-            imageHeight = mediaImage.height,
-            sensorOrientationDegrees = rotationDegrees,
-            size = android.util.Size(previewView.width, previewView.height)
-        )
-        hintText = sdkViewModel.getOcrHintMsg(
-            context = context,
-            code = cardResult?.code ?: -1
-        )
-        if (cardResult?.code == ResultCode.SUCCESS) {
-            provider.unbindAll()
-            imageAnalyzer.clearAnalyzer()
-            ocrViewModel.ocrSuccess()
-        } else {
-            cardResult?.ssdRectRatio?.let { ratio ->
-                ssdRect = mapRatioToViewRect(
-                    ratio = ratio,
-                    imageWidth = mediaImage.width,
-                    imageHeight = mediaImage.height,
-                    previewWidth = previewView.width,
-                    previewHeight = previewView.height,
-                    scaleType = "FIT_START"
-                )
-            }
-        }
-        imageProxy.close()
-    } else {
-        imageProxy.close()
-    }
-}
+ssdRect = mapRatioToViewRect(
+    ratio = ratio,
+    imageWidth = mediaImage.width,
+    imageHeight = mediaImage.height,
+    previewWidth = previewView.width,
+    previewHeight = previewView.height,
+    rotationDegrees = rotationDegrees,
+    scaleType = "FIT_START"
+)
 
 private fun mapRatioToViewRect(
     ratio: RectF,
@@ -45,29 +14,62 @@ private fun mapRatioToViewRect(
     imageHeight: Int,
     previewWidth: Int,
     previewHeight: Int,
+    rotationDegrees: Int,
     scaleType: String = "FIT_START"
 ): Rect {
-    // Step1: 计算缩放比例（保持宽高比）
-    val scale = min(
-        previewWidth.toFloat() / imageWidth.toFloat(),
-        previewHeight.toFloat() / imageHeight.toFloat()
+    // Step1: 如果有旋转，先交换宽高
+    val (srcWidth, srcHeight) = if (rotationDegrees == 90 || rotationDegrees == 270) {
+        imageHeight to imageWidth
+    } else {
+        imageWidth to imageHeight
+    }
+
+    // Step2: FIT_START 用 max (保证画面能填满 View)
+    val scale = max(
+        previewWidth.toFloat() / srcWidth.toFloat(),
+        previewHeight.toFloat() / srcHeight.toFloat()
     )
 
-    val scaledWidth = imageWidth * scale
-    val scaledHeight = imageHeight * scale
+    val scaledWidth = srcWidth * scale
+    val scaledHeight = srcHeight * scale
 
-    // Step2: 偏移量 (FIT_START -> 左上角对齐)
-    val dx = if (scaleType == "FIT_START") 0f else (previewWidth - scaledWidth) / 2f
-    val dy = if (scaleType == "FIT_START") 0f else (previewHeight - scaledHeight) / 2f
+    // Step3: 偏移量 (FIT_START -> 左上角)
+    val dx = 0f
+    val dy = 0f
 
-    // Step3: 先映射到原图尺寸，再缩放 & 偏移
-    val rectF = RectF(
+    // Step4: 先映射到原图坐标
+    var rectF = RectF(
         ratio.left * imageWidth,
         ratio.top * imageHeight,
         ratio.right * imageWidth,
         ratio.bottom * imageHeight
     )
 
+    // Step5: 如果有旋转，先把 rectF 转换到旋转后的坐标系
+    if (rotationDegrees == 90) {
+        rectF = RectF(
+            srcWidth - rectF.bottom,
+            rectF.left,
+            srcWidth - rectF.top,
+            rectF.right
+        )
+    } else if (rotationDegrees == 180) {
+        rectF = RectF(
+            srcWidth - rectF.right,
+            srcHeight - rectF.bottom,
+            srcWidth - rectF.left,
+            srcHeight - rectF.top
+        )
+    } else if (rotationDegrees == 270) {
+        rectF = RectF(
+            rectF.top,
+            srcHeight - rectF.right,
+            rectF.bottom,
+            srcHeight - rectF.left
+        )
+    }
+
+    // Step6: 缩放 & 偏移
     rectF.left = rectF.left * scale + dx
     rectF.top = rectF.top * scale + dy
     rectF.right = rectF.right * scale + dx
