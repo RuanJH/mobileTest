@@ -1,3 +1,13 @@
+package com.example.demo.di
+
+import androidx.lifecycle.*
+import androidx.savedstate.SavedStateRegistryOwner
+import javax.inject.Inject
+import javax.inject.Provider
+
+/**
+ * 自定义的 ViewModelFactory，可以让 Dagger 创建的 ViewModel 拿到系统提供的 SavedStateHandle。
+ */
 class DaggerSavedStateViewModelFactory @Inject constructor(
     private val providers: Map<Class<out ViewModel>, @JvmSuppressWildcards Provider<ViewModel>>
 ) {
@@ -10,8 +20,9 @@ class DaggerSavedStateViewModelFactory @Inject constructor(
             ): T {
                 val provider = providers[modelClass]
                     ?: error("No provider found for ${modelClass.name}")
+
                 val viewModel = provider.get()
-                if (viewModel is SavedStateViewModel) {
+                if (viewModel is SupportsSavedStateHandle) {
                     viewModel.setSavedStateHandle(handle)
                 }
                 return viewModel as T
@@ -19,6 +30,14 @@ class DaggerSavedStateViewModelFactory @Inject constructor(
         }
     }
 }
+
+/**
+ * 所有需要 SavedStateHandle 的 ViewModel 都实现这个接口。
+ */
+interface SupportsSavedStateHandle {
+    fun setSavedStateHandle(handle: SavedStateHandle)
+}
+
 
 
 class SharedViewModel @Inject constructor() : ViewModel(), SavedStateViewModel {
