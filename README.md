@@ -1,3 +1,15 @@
+// 在 build.gradle 顶部添加（与 dependencies 同级）
+configurations {
+    all {
+        // 排除所有依赖中重复的 net.sf.scuba 包（保留 scuba-smartcards 的版本）
+        exclude group: 'net.sf.scuba', module: 'scuba-smartcards'
+        // 排除 szca-auth-eid 中内置的 cert-cvc 和 jmrtd
+        exclude group: 'org.ejbca.cvc', module: 'cert-cvc'
+        exclude group: 'org.jmrtd', module: 'jmrtd'
+    }
+}
+
+
 dependencies {
     implementation('com.hsbc.mobilebanking.android.external.one-connect-sdk:eid-travel-bc:1.0.3.2') {
         exclude group: 'net.sf.scuba', module: 'scuba-smartcards'
