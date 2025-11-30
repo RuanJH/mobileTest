@@ -1,3 +1,25 @@
+dependencies {
+    implementation('com.hsbc.mobilebanking.android.external.one-connect-sdk:eid-travel-bc:1.0.3.2') {
+        exclude group: 'net.sf.scuba', module: 'scuba-smartcards'
+    }
+    
+    implementation('com.hsbc.mobilebanking.android.external.one-connect-sdk:szca-auth-eid:1.1.0.1') {
+        exclude group: 'org.ejbca.cvc', module: 'cert-cvc'
+        exclude group: 'org.jmrtd', module: 'jmrtd'
+    }
+    
+    // 或者如果 scuba-smartcards 是独立依赖，可以排除它
+    implementation('net.sf.scuba:scuba-smartcards:0.0.20') {
+        exclude group: 'net.sf.scuba.data'
+        exclude group: 'net.sf.scuba.smartcards'
+        exclude group: 'net.sf.scuba.tlv'
+        exclude group: 'net.sf.scuba.util'
+    }
+}
+
+
+
+
 package com.pa.cardcheck.ui
 
 import android.annotation.SuppressLint
