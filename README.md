@@ -1,3 +1,258 @@
+What You CAN Do (UI/UX Customization Supported by Onfido Android SDK)
+1. Apply custom themes
+
+You can override Onfido’s default theme using your own themes.xml or styles.xml, based on:
+
+OnfidoBaseActivityTheme
+
+OnfidoBaseDarkTheme
+
+2. Customize colors
+
+You can change:
+
+Primary / secondary colors
+
+Background colors
+
+Button colors
+
+Highlight colors
+
+3. Customize typography & fonts
+
+You can replace:
+
+Default fonts
+
+Text sizes
+
+Text styles (bold, medium, regular)
+
+4. Replace icons and drawable assets
+
+You can override Onfido’s icons with your own assets, including:
+
+Buttons
+
+Back/navigation icons
+
+Document icons
+
+Face capture icons
+
+5. Update strings/text
+
+You can override and localize:
+
+Titles
+
+Subtitles
+
+Button labels
+
+Instructions and descriptions
+
+6. Enable dark mode or force light/dark mode
+
+You can:
+
+Follow system theme
+
+Force dark theme
+
+Force light theme
+
+7. Configure the verification flow
+
+Using withCustomFlow(), you can choose:
+
+Which steps to include (document capture, selfie/face capture, etc.)
+
+Step order
+
+Whether to skip intro/confirmation screens
+
+8. Customize some UX behaviors
+
+Such as:
+
+Vibration feedback
+
+Screen transitions (limited)
+
+Timeouts
+
+Retry screens
+
+❌ What You CANNOT Do (UI/UX Limitations of Onfido Android SDK)
+1. You cannot fully replace the Onfido UI
+
+You cannot build your own screens using:
+
+Custom Activity / Fragment
+
+Jetpack Compose
+
+Custom layouts (XML)
+
+The core capture screens must use Onfido’s provided UI components.
+
+2. You cannot modify the internal camera UI
+
+You cannot change:
+
+Camera preview layout
+
+Capture button location
+
+Guide overlays
+
+Crop masks
+
+Animation behavior
+
+Scan/analysis screens
+
+3. You cannot redesign the verification flow screens
+
+For example, you cannot redesign:
+
+Document selection UI
+
+Selfie instructions
+
+Capture confirmation screens
+
+Upload progress screen
+
+Final success/failure screens
+
+Only theme-based styling is allowed, not layout replacement.
+
+4. You cannot intercept or rewrite core UX logic
+
+Such as:
+
+When the SDK decides a capture is valid/invalid
+
+How the SDK shows instructions
+
+How many retries are allowed
+
+Error screen structure
+
+Internal navigation structure
+
+5. You cannot embed the Onfido UI inside your own custom components
+
+For example:
+
+A Compose Box()
+
+A bottom sheet
+
+A dialog
+
+A custom camera container
+
+The SDK requires its own full-screen Activities.
+
+6. You cannot create a completely custom flow using Onfido’s APIs
+
+The SDK does not expose:
+
+Raw camera frames
+
+Raw capture validation
+
+Face liveness algorithms
+
+Document edge detection
+
+Standalone capture components
+
+Meaning: You cannot “use Onfido engine with your own UI”.
+
+⭐ Summary
+Onfido allows:
+
+🎨 Styling the SDK’s existing screens.
+
+Onfido does NOT allow:
+
+🛠️ Completely replacing the UI or building your own Compose-based capture experience.
+
+📌 Onfido Android SDK – UI/UX Capabilities Overview
+1. Summary Table: What You CAN and CANNOT Customize
+Category	Supported (CAN DO)	Not Supported (CANNOT DO)
+Themes	Apply custom themes based on Onfido’s base themes	Replace entire layout/theme with fully custom designs
+Colors	Override primary/secondary colors, backgrounds, highlights	Change layout structure or placement of UI elements
+Typography	Use custom fonts and text styles	Modify text layout, spacing, component hierarchy
+Icons / Drawables	Replace icons, button graphics, loading indicators	Change camera overlay shapes or detection masks
+Strings / Text	Override and localize all visible strings	Change dynamic text logic or validation messages
+Dark Mode	Support light/dark mode or force a specific mode	Full custom rendering (e.g., Compose-only theme layers)
+Flow Control	Define custom flow steps (documents, selfie, etc.)	Redesign flow screens or embed custom UI in the flow
+UX Behavior	Configure limited UX options (retry behavior, vibration)	Change internal UX logic, animations, or transitions
+Integration	Launch SDK screens from your app	Embed SDK UI inside custom views / Compose / dialogs
+Camera	Use Onfido's built-in camera & detection	Build your own camera UI while using Onfido’s backend
+2. Detailed CAN DO List
+
+✔ Modify theme (colors, fonts, shapes, icons)
+✔ Override all display strings
+✔ Apply light/dark mode
+✔ Customize the flow: choose steps and order
+✔ Replace drawable resources
+✔ Adjust some behavior settings (retry count, vibration, timeouts)
+✔ Brand the SDK screens to match your app’s style
+✔ Add your own logic before and after the SDK flow
+✔ Localize all text into multiple languages
+
+3. Detailed CANNOT DO List
+
+❌ No full UI replacement
+You cannot replace Onfido screens with your own Activities, Fragments, or Jetpack Compose UI.
+
+❌ No custom camera views
+Cannot customize camera preview, guide frames, shutter button position, or overlays.
+
+❌ No altering of built-in screen layouts
+Cannot change component positions, animations, or hierarchy.
+
+❌ No embedding into your own UI components
+Cannot run Onfido inside:
+
+Compose screens
+
+Bottom sheets
+
+Dialogs
+
+Custom containers
+
+It must run full-screen through SDK-provided Activities.
+
+❌ No access to low-level detection logic
+Cannot access:
+
+Raw camera frames
+
+Face/liveness detection results
+
+Document edge detection engine
+
+Custom validation logic
+
+❌ No custom verification flow outside provided API
+Flow must follow Onfido’s predefined screen sequence.
+
+4. One-Sentence Executive Summary (可用于需求文档/审批说明)
+
+Onfido Android SDK supports theme-based UI customization (colors, fonts, icons, strings) and configurable flows, but does not support fully custom UI, custom camera interfaces, or replacing the SDK’s internal screens with your own implementation.
+
+
+
+
 // 在 build.gradle 顶部添加（与 dependencies 同级）
 configurations {
     all {
