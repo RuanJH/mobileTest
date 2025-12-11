@@ -1,0 +1,861 @@
+// Camera18ComposeActivity.kt
+package com.your.package    // <-- 改为你自己的包名
+
+/*
+ 单文件完整移植：Compose + CameraX + 完整18版识别逻辑（移植自你给出的 Java Camera18CardActivity）
+  - 预览（PreviewView）
+  - 实时帧分析（ImageAnalysis）
+  - 新旧卡检测（PaDetectorManager.getIdCardType）
+  - 第一张质量检测（do18QualityInspection）
+  - 打开闪光灯后抓拍多张（最多 30 张）
+  - 根据亮度排序并选择两张用于 OCR / 鉴伪
+  - 进行前端鉴伪（do18Identification）
+  - 上传 OCR（ApiCreater.ocr）
+  - 保存临时文件在 cacheDir 下
+  - 震动提示
+ 重要：需要在项目中提供 PaDetectorManager、ApiCreater 等原 SDK/工具。请确保 CameraX/Compose 依赖已加入。
+
+ Gradle (示例)：
+ implementation "androidx.camera:camera-core:1.2.3"
+ implementation "androidx.camera:camera-camera2:1.2.3"
+ implementation "androidx.camera:camera-lifecycle:1.2.3"
+ implementation "androidx.camera:camera-view:1.2.3"
+ implementation "androidx.compose.ui:ui:1.4.0"
+ implementation "androidx.activity:activity-compose:1.7.0"
+ implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.6.4'
+ */
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.app.Service
+import android.content.Context
+import android.content.pm.ActivityInfo
+import android.content.pm.PackageManager
+import android.graphics.*
+import android.media.Image
+import android.os.Bundle
+import android.os.Vibrator
+import android.util.Log
+import android.util.Size
+import android.view.Surface
+import android.view.ViewGroup
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.core.*
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.*
+import androidx.compose.material.Button
+import androidx.compose.material.Text
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
+import androidx.core.graphics.toRect
+import androidx.lifecycle.lifecycleScope
+import com.pingan.idverify.bean.IdCardType
+import com.pingan.idverify.bean.Identification18Result
+import com.pingan.idverify.bean.QualityInspectionOptionParams
+import com.pingan.idverify.bean.QualityInspectionResult
+import com.pingan.idverify.detector.PaDetectorManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import retrofit2.Call
+import retrofit2.Callback
+import retrofit2.Response
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.util.*
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.collections.ArrayList
+import android.graphics.Point
+import com.pa.cardcheck.net.ApiCreater
+import com.pa.cardcheck.net.request.OcrRequestBody
+import com.pa.cardcheck.net.response.OcrResponse
+import com.pa.cardcheck.bean.CardResult
+import com.pa.cardcheck.event.OcrEvent
+import org.greenrobot.eventbus.EventBus
+
+class Camera18ComposeActivity : ComponentActivity() {
+
+    private val TAG = "Camera18ComposeActivity"
+
+    // mimic original Java constants
+    private val SCREEN_RECT_WIDTH_FINAL_PORTRAIT = 340
+    private val SCREEN_RECT_WIDTH_FINAL_LANDSCAPE = 430
+    private val SCREEN_RECT_HEIGHT_FINAL_PORTRAIT = 215
+    private val SCREEN_RECT_HEIGHT_FINAL_LANDSCAPE = 272
+
+    private val LIGHT_CAPTURE_MAX_COUNT = 30
+
+    // state variables
+    private var idCardTypeResult: Int = IdCardType.ERROR_INVALID_ID_CARD
+    private var photoIndex = 0
+    private var correctedImage1: Bitmap? = null
+    private var correctedImage2: Bitmap? = null
+    private var correctedImage3: Bitmap? = null
+    private var imageDigest1: String? = null
+    private var imageDigest2: String? = null
+    private var imageDigest3: String? = null
+    private var imageBase641: String? = null
+    private var imageBase642: String? = null
+    private var imageBase643: String? = null
+
+    // flash-capture list
+    private val normalFlashFilePaths = Collections.synchronizedList(ArrayList<Pair<String, Float>>())
+    private val normalFlashEdgeResult = Collections.synchronizedList(ArrayList<Int>())
+    private val lightCaptureProgressCount = AtomicInteger(0)
+
+    // timing control
+    private var openLightTime: Long = 0
+    private var startCaptureTime: Long = 0
+    private val intervalFromOpenLightToStartCapture = 200L
+    private val intervalFromStartCaptureToEndCapture = 700L
+    private val intervalFromStartCaptureToCloseLight = 600L
+
+    // thresholds
+    private val lightThresholds = floatArrayOf(100f, 220f)
+
+    // helper
+    private val analyzerExecutor = Executors.newSingleThreadExecutor()
+    private var cameraControl: CameraControl? = null
+    private var cameraInfo: CameraInfo? = null
+    private var previewViewRef: PreviewView? = null
+
+    // preview size & vertices
+    private var previewViewSize = Point(0, 0)
+    private var previewViewSizeAfterResize = Point(0, 0)
+    private var photoFrameVerticesAfterResize: Array<Point> = arrayOf()
+
+    // vibrate
+    private var vibrator: Vibrator? = null
+
+    // detect img dir name (cache)
+    private var mDetectImgDirName: String? = null
+
+    // need get preview frame flag
+    private var needGetPreviewFrame = false
+    private var isOperatingPicture = false
+    private var frameTotal: Long = 0
+    private var qualityPassed = false
+    private var saveCorrectedImage = true
+
+    // permission launcher
+    private val requestCameraPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (!granted) {
+                Toast.makeText(this, "相机权限被拒绝", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        // request CAMERA permission if needed
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            requestCameraPermission.launch(Manifest.permission.CAMERA)
+        }
+
+        // vibrate service
+        vibrator = getSystemService(Service.VIBRATOR_SERVICE) as Vibrator?
+
+        setContent {
+            val context = LocalContext.current
+            val lifecycleOwner = LocalLifecycleOwner.current
+            val configuration = LocalConfiguration.current
+            val isLandscape = configuration.screenWidthDp > configuration.screenHeightDp
+
+            Camera18ComposeScreen(
+                isLandscape = isLandscape,
+                onPreviewInitialized = { previewView, width, height ->
+                    previewViewRef = previewView
+                    previewViewSize = Point(width, height)
+                    previewViewSizeAfterResize = previewViewSize // we keep same (CameraX handles aspect) - but you can adjust
+                    photoFrameVerticesAfterResize = getPhotoFrameVertices(previewViewSizeAfterResize, isLandscape, resources.displayMetrics.density)
+                    startCameraX(previewView, lifecycleOwner)
+                },
+                onHint = { hint ->
+                    // you can show toast or Compose text; here we show toast to be simple
+                    runOnUiThread { Toast.makeText(this, hint, Toast.LENGTH_SHORT).show() }
+                }
+            )
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        analyzerExecutor.shutdown()
+    }
+
+    // -------------------------------
+    // Compose screen + overlay
+    // -------------------------------
+    @Composable
+    fun Camera18ComposeScreen(
+        isLandscape: Boolean,
+        onPreviewInitialized: (PreviewView, Int, Int) -> Unit,
+        onHint: (String) -> Unit
+    ) {
+        val context = LocalContext.current
+        val previewView = remember { PreviewView(context) }
+        AndroidView(factory = {
+            previewView.apply {
+                layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            }
+        }, update = { view ->
+            view.post {
+                val w = view.width
+                val h = view.height
+                if (w > 0 && h > 0) {
+                    onPreviewInitialized(view, w, h)
+                }
+            }
+        }, modifier = Modifier.fillMaxSize())
+
+        // overlay draw
+        Box(modifier = Modifier.fillMaxSize()) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                if (photoFrameVerticesAfterResize.size == 4) {
+                    val left = photoFrameVerticesAfterResize.minOf { it.x }.toFloat()
+                    val top = photoFrameVerticesAfterResize.minOf { it.y }.toFloat()
+                    val right = photoFrameVerticesAfterResize.maxOf { it.x }.toFloat()
+                    val bottom = photoFrameVerticesAfterResize.maxOf { it.y }.toFloat()
+
+                    // dim background
+                    drawRect(color = Color(0x99000000.toInt()))
+                    // transparent hole (approx. by drawing over)
+                    // Compose Canvas doesn't support cutout easily here; we simply draw a lighter rect to indicate frame
+                    drawRect(color = Color.Transparent, topLeft = Offset(left, top), size = androidx.compose.ui.geometry.Size(right - left, bottom - top))
+                    // border
+                    drawRect(color = Color.Green, topLeft = Offset(left, top), size = androidx.compose.ui.geometry.Size(right - left, bottom - top), style = androidx.compose.ui.graphics.drawscope.Stroke(width = 6f))
+                }
+            }
+
+            Column(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.Top) {
+                Text(text = "将身份证放入框内，保持平整", color = Color.White, fontSize = 18.sp)
+            }
+
+            // control buttons for debugging
+            Column(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.Bottom) {
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+                    Button(onClick = {
+                        // reset detection
+                        resetIdCardDetect()
+                        onHint("已重置")
+                    }, modifier = Modifier.padding(8.dp)) {
+                        Text("重拍")
+                    }
+                }
+            }
+        }
+    }
+
+    // -------------------------------
+    // CameraX start
+    // -------------------------------
+    @SuppressLint("UnsafeOptInUsageError")
+    private fun startCameraX(previewView: PreviewView, lifecycleOwner: androidx.lifecycle.LifecycleOwner) {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        cameraProviderFuture.addListener({
+            val cameraProvider = cameraProviderFuture.get()
+            val preview = Preview.Builder().build().also {
+                it.setSurfaceProvider(previewView.surfaceProvider)
+            }
+
+            val imageAnalysis = ImageAnalysis.Builder()
+                .setTargetResolution(Size(1280, 720))
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
+
+            imageAnalysis.setAnalyzer(analyzerExecutor) { imageProxy ->
+                try {
+                    onPreviewFrame(imageProxy)
+                } catch (e: Exception) {
+                    Log.e(TAG, "analyzer error", e)
+                } finally {
+                    imageProxy.close()
+                }
+            }
+
+            try {
+                cameraProvider.unbindAll()
+                val camera = cameraProvider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageAnalysis)
+                cameraControl = camera.cameraControl
+                cameraInfo = camera.cameraInfo
+            } catch (e: Exception) {
+                Log.e(TAG, "bind camera failed", e)
+            }
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    // -------------------------------
+    // Preview frame handler (核心)
+    // -------------------------------
+    private fun onPreviewFrame(imageProxy: ImageProxy) {
+        frameTotal++
+        if (!needGetPreviewFrame) {
+            // only start getting when explicitly set. To mimic Java behavior we set true after preview started
+            needGetPreviewFrame = true
+        }
+
+        if (frameTotal <= 10) return
+        if (isOperatingPicture) return
+
+        isOperatingPicture = true
+
+        // do in background executor
+        analyzerExecutor.execute {
+            try {
+                val bitmap = imageProxyToBitmap(imageProxy) ?: return@execute
+
+                // save detect dir name if not exists
+                if (mDetectImgDirName == null) mDetectImgDirName = "${Date().time}${File.separator}"
+
+                // photoIndex == 0: do type detection + quality check for first photo
+                if (photoIndex == 0) {
+                    // get id card type
+                    val cardType = try {
+                        PaDetectorManager.getIdCardType(this, bitmap, previewViewSizeAfterResize, photoFrameVerticesAfterResize)
+                    } catch (e: Exception) {
+                        null
+                    }
+                    val idType = cardType?.result ?: IdCardType.ERROR_INVALID_ID_CARD
+                    updateUiByIdCardType(idType)
+                    idCardTypeResult = idType
+
+                    if (idCardTypeResult == IdCardType.ID_CARD_TYPE_18) {
+                        // first quality check
+                        val quality = checkQuality(bitmap)
+                        updateUiByQualityInspectionResult(quality, false)
+                        if (quality == null || quality.result != QualityInspectionResult.SUCCESS) {
+                            // not qualified, wait next frame
+                            return@execute
+                        }
+
+                        // save first corrected image
+                        correctedImage1 = quality.correctBitmap
+                        imageDigest1 = quality.correctImageDigest
+                        imageBase641 = quality.correctImageBase64
+
+                        // optionally save corrected image to cache
+                        if (saveCorrectedImage) {
+                            try {
+                                saveBitmapToCache(correctedImage1!!, "corrected_image_1.jpg")
+                            } catch (e: Exception) {
+                                Log.e(TAG, "save corrected1 fail", e)
+                            }
+                        }
+
+                        // proceed to flash captures
+                        photoIndex++
+                        openAutoFlash()
+                        openLightTime = System.currentTimeMillis()
+                        Log.d(TAG, "开启闪光灯")
+                    } else {
+                        // not 18 version or invalid, just wait
+                    }
+                } else {
+                    // after turning on flash
+                    val currentTime = System.currentTimeMillis()
+
+                    // check close flash time
+                    if (normalFlashFilePaths.size >= LIGHT_CAPTURE_MAX_COUNT ||
+                        (startCaptureTime != 0L && currentTime - startCaptureTime >= intervalFromStartCaptureToCloseLight)
+                    ) {
+                        closeAutoFlash()
+                    }
+
+                    // check finish capture
+                    if (normalFlashFilePaths.size >= LIGHT_CAPTURE_MAX_COUNT ||
+                        (startCaptureTime != 0L && currentTime - startCaptureTime >= intervalFromStartCaptureToEndCapture)
+                    ) {
+                        // capture finished; process saved files
+                        val completeMsg = processAfterFlashCapture()
+                        runOnUiThread { showHint(completeMsg) }
+                        isOperatingPicture = false
+                        return@execute
+                    }
+
+                    // begin capture after openLightTime passed
+                    if (currentTime - openLightTime >= intervalFromOpenLightToStartCapture) {
+                        // run quality/light check for light frames
+                        lightCaptureProgressCount.incrementAndGet()
+                        val qualityForLight = checkQualityForLight(bitmap)
+                        val passedTemp = (qualityForLight?.result == QualityInspectionResult.SUCCESS)
+                        if (!qualityPassed && passedTemp) {
+                            qualityPassed = true
+                            startCaptureTime = currentTime
+                            Log.d(TAG, "闪光灯抓图 开始")
+                        }
+
+                        if (qualityPassed) {
+                            // save cutout file to cache
+                            val cut = qualityForLight?.cutOutBitmap
+                            val score = qualityForLight?.score ?: 0f
+                            if (cut != null && normalFlashFilePaths.size < LIGHT_CAPTURE_MAX_COUNT) {
+                                val path = saveBitmapToCache(cut, "${mDetectImgDirName}${currentTime}_light_cut.jpg")
+                                normalFlashFilePaths.add(Pair(path, score))
+                            }
+                        }
+
+                        lightCaptureProgressCount.decrementAndGet()
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "operatePicture error", e)
+            } finally {
+                isOperatingPicture = false
+            }
+        }
+    }
+
+    // -------------------------------
+    // After flash capture: pick two images, quality check, identification & OCR
+    // -------------------------------
+    private fun processAfterFlashCapture(): String {
+        if (normalFlashFilePaths.size < 2) {
+            resetIdCardDetect()
+            return "合格照片 < 2，重新拍摄"
+        }
+
+        // for each, do edge detection and possibly replace with edge result outImg
+        normalFlashEdgeResult.clear()
+        for (i in 0 until normalFlashFilePaths.size) {
+            val filePath = normalFlashFilePaths[i].first
+            var bmp = BitmapFactory.decodeFile(filePath)
+            val edgeResult = try {
+                PaDetectorManager.detectEdgeNew(this, bmp)
+            } catch (e: Exception) {
+                null
+            }
+            if (edgeResult != null && edgeResult.outImg != null) {
+                bmp = edgeResult.outImg
+                // overwrite saved file with the edge outImg
+                try {
+                    saveBitmapToFile(bmp, filePath)
+                } catch (e: Exception) {
+                    Log.e(TAG, "overwrite edge outImg fail", e)
+                }
+            }
+            normalFlashEdgeResult.add(if (edgeResult == null) VerticesDetectionResultStub.EDGE_TYPE_OTHER else edgeResult.cardType)
+            val lightValue = try {
+                PaDetectorManager.getLightLightValue(bmp)
+            } catch (e: Exception) {
+                0f
+            }
+            normalFlashFilePaths[i] = Pair(filePath, lightValue)
+        }
+
+        // sort by brightness value (ascending)
+        Collections.sort(normalFlashFilePaths) { a, b -> (a.second - b.second).toInt() }
+
+        val size = normalFlashFilePaths.size
+        val firstIndex = 0
+        val secondIndex = size / 2
+
+        // check edge result flags
+        if (normalFlashEdgeResult.getOrNull(firstIndex) != 0 || normalFlashEdgeResult.getOrNull(secondIndex) != 0) {
+            resetIdCardDetect()
+            return "图片质量不合格，重新拍摄"
+        }
+
+        return try {
+            // pick two files
+            val flashFilePath1 = normalFlashFilePaths[firstIndex].first
+            val flashFilePath2 = normalFlashFilePaths[secondIndex].first
+            val flashBitmap1 = BitmapFactory.decodeFile(flashFilePath1)
+            val flashBitmap2 = BitmapFactory.decodeFile(flashFilePath2)
+
+            // last blurriness check
+            val flashResultFirst = PaDetectorManager.doQualityInspectionForLight(this, flashBitmap1)
+            val flashResultSecond = PaDetectorManager.doQualityInspectionForLight(this, flashBitmap2)
+
+            if (flashResultFirst.result == QualityInspectionResult.BLURRING || flashResultSecond.result == QualityInspectionResult.BLURRING) {
+                resetIdCardDetect()
+                "图片模糊，重新拍摄"
+            } else {
+                // success: set correctedImage2/3, imageDigests, base64s
+                correctedImage2 = flashBitmap1
+                imageDigest2 = flashResultFirst.correctImageDigest
+                imageBase642 = flashResultFirst.correctImageBase64
+
+                correctedImage3 = flashBitmap2
+                imageDigest3 = flashResultSecond.correctImageDigest
+                imageBase643 = flashResultSecond.correctImageBase64
+
+                // do identification and OCR
+                doIdentificationAndOcrDetect(flashFilePath1, flashFilePath2)
+                "拍摄完成"
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "processAfterFlashCapture error", e)
+            resetIdCardDetect()
+            "处理失败，重新拍摄"
+        } finally {
+            // delete cached temp files
+            try {
+                normalFlashFilePaths.forEach { (path, _) -> File(path).delete() }
+            } catch (e: Exception) {
+                Log.e(TAG, "delete temp fail", e)
+            }
+        }
+    }
+
+    // -------------------------------
+    // Identification and OCR
+    // -------------------------------
+    private fun doIdentificationAndOcrDetect(flashFilePath1: String, flashFilePath2: String) {
+        // vibrate
+        checkVibrate()
+
+        // show loading hint
+        runOnUiThread { showHint("识别中...") }
+
+        // front-end identification (three bitmaps)
+        val idResult = try {
+            PaDetectorManager.do18Identification(this, arrayOf(correctedImage1, correctedImage2, correctedImage3))
+        } catch (e: Exception) {
+            null
+        }
+
+        // release bitmaps except we need some later? release as in Java
+        correctedImage1 = null // already used
+        // correctedImage2/3 kept for ocr? We'll rely on base64 tokens from quality results
+
+        completeShot(idResult)
+    }
+
+    private fun completeShot(identificationResult: Identification18Result?) {
+        needGetPreviewFrame = false
+        runOnUiThread {
+            // send result to next activity (use your existing ResultActivity)
+            val cardResult = CardResult()
+            cardResult.cardType = 2
+            cardResult.allPassed = identificationResult?.isSuccess ?: false
+            val errCodes = identificationResult?.errorCodes
+            cardResult.hologramPassed = (errCodes == null || !errCodes.contains(Identification18Result.NO_HOLOGRAM))
+
+            ocr(cardResult)
+        }
+    }
+
+    // -------------------------------
+    // OCR uploading (reuse ApiCreater from your project)
+    // -------------------------------
+    private fun ocr(cardResult: CardResult) {
+        val time1 = System.currentTimeMillis()
+        val base64Images = arrayOf(imageBase641, imageBase643, imageBase641, imageBase641)
+        val imageDigests = arrayOf(imageDigest1, imageDigest3, imageDigest1, imageDigest1)
+
+        val requestBody = OcrRequestBody()
+        requestBody.seeThroughFlag = if (true) "1" else "0"  // keep checkWindow true
+        requestBody.file.images = base64Images
+        requestBody.file.tokens = imageDigests
+
+        ApiCreater.create(this).ocr(requestBody).enqueue(object : Callback<OcrResponse> {
+            override fun onResponse(call: Call<OcrResponse>, response: Response<OcrResponse>) {
+                Log.i(TAG, "OCR cost: ${System.currentTimeMillis() - time1}ms")
+                val ocrResponse = response.body()
+                if (ocrResponse != null) {
+                    Log.i(TAG, "OCR 成功\n$ocrResponse")
+                } else {
+                    Toast.makeText(this@Camera18ComposeActivity, "network exception", Toast.LENGTH_SHORT).show()
+                }
+
+                if (ocrResponse != null && ocrResponse.data != null) {
+                    EventBus.getDefault().postSticky(OcrEvent(true, idCardTypeResult, ocrResponse))
+                }
+                startNextActivity(cardResult)
+            }
+
+            override fun onFailure(call: Call<OcrResponse>, t: Throwable) {
+                Log.e(TAG, "OCR 失败：${t.message}")
+                EventBus.getDefault().postSticky(OcrEvent(true))
+                startNextActivity(cardResult)
+            }
+        })
+    }
+
+    private fun startNextActivity(cardResult: CardResult) {
+        EventBus.getDefault().postSticky(cardResult)
+        // ResultActivity.makeIntent assumed available in your project
+        startActivity(com.pa.cardcheck.ui.ResultActivity.makeIntent(this, cardResult))
+        finish()
+    }
+
+    // -------------------------------
+    // Quality checks (wrap PaDetectorManager calls)
+    // -------------------------------
+    private fun checkQuality(rawBitmap: Bitmap): QualityInspectionResult? {
+        val optionParams = QualityInspectionOptionParams()
+        optionParams.needCheckLightSpot = true
+        optionParams.needCheckGray = true
+        optionParams.needControlAngle = false
+        optionParams.flashCheck = false
+        // set transparent window
+        optionParams.needCheckWindow = true
+
+        return try {
+            PaDetectorManager.do18QualityInspection(this, rawBitmap, previewViewSizeAfterResize, photoFrameVerticesAfterResize, optionParams)
+        } catch (e: Exception) {
+            Log.e(TAG, "checkQuality fail", e)
+            null
+        }
+    }
+
+    private fun checkQualityForLight(yuvBitmap: Bitmap): QualityInspectionResult? {
+        return try {
+            // original Java used do18QualityInspectionForLight with yuv data; we have bitmap -> attempt to call equivalent:
+            PaDetectorManager.do18QualityInspectionForLight(this,
+                bitmapToYuvByteArray(yuvBitmap),
+                yuvBitmap.width,
+                yuvBitmap.height,
+                0, // displayOrientation - assuming 0; CameraX already rotated
+                previewViewSizeAfterResize,
+                photoFrameVerticesAfterResize,
+                lightThresholds,
+                !qualityPassed
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "checkQualityForLight fail", e)
+            null
+        }
+    }
+
+    // -------------------------------
+    // Helper: update UI / hints (simple)
+    // -------------------------------
+    private fun updateUiByIdCardType(idCardType: Int) {
+        when (idCardType) {
+            IdCardType.ID_CARD_TYPE_03 -> {
+                runOnUiThread { showHint("检测到03卡，仅支持18版") }
+            }
+            IdCardType.ID_CARD_TYPE_18 -> {
+                runOnUiThread { showHint("检测到18版身份证") }
+            }
+            IdCardType.ERROR_INVALID_ID_CARD -> {
+                runOnUiThread { showHint("无效身份证") }
+            }
+            else -> {
+                // map error codes to messages if needed
+            }
+        }
+    }
+
+    private fun updateUiByQualityInspectionResult(result: QualityInspectionResult?, isCheckIdCardType: Boolean) {
+        if (result == null) return
+        when (result.result) {
+            QualityInspectionResult.SDK_AUTH_ERROR -> runOnUiThread { showHint("授权异常") }
+            QualityInspectionResult.NO_CARD_DETECTED -> runOnUiThread { showHint("未检测到身份证") }
+            QualityInspectionResult.TOO_FAR_OUT_BORDER -> runOnUiThread { showHint("身份证超出边框") }
+            QualityInspectionResult.NOT_FIT_THE_BORDER -> runOnUiThread { showHint("身份证未对齐边框") }
+            QualityInspectionResult.TOO_FAR_IN_BORDER -> runOnUiThread { showHint("身份证离边框太远") }
+            QualityInspectionResult.TOO_DARK -> runOnUiThread { showHint("光线太暗") }
+            QualityInspectionResult.TOO_BRIGHT -> runOnUiThread { showHint("光线太强") }
+            QualityInspectionResult.HAS_LIGHT_SPOT -> runOnUiThread { showHint("有光斑") }
+            QualityInspectionResult.IS_GRAY_COPY -> runOnUiThread { showHint("检测到复印件") }
+            QualityInspectionResult.BLURRING -> runOnUiThread { showHint("图像模糊") }
+            QualityInspectionResult.NO_WINDOW -> runOnUiThread { showHint("未检测到透明窗") }
+            QualityInspectionResult.SUCCESS -> {
+                runOnUiThread {
+                    showHint("质量检测通过")
+                    // vibrate for pass (mimic original)
+                    if (photoIndex != 0) vibrate()
+                }
+            }
+            else -> {}
+        }
+    }
+
+    private fun showHint(msg: String) {
+        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+    }
+
+    // -------------------------------
+    // Flash control
+    // -------------------------------
+    private fun openAutoFlash() {
+        try {
+            cameraControl?.enableTorch(true)
+        } catch (e: Exception) {
+            Log.e(TAG, "openAutoFlash fail", e)
+        }
+    }
+
+    private fun closeAutoFlash() {
+        try {
+            cameraControl?.enableTorch(false)
+        } catch (e: Exception) {
+            Log.e(TAG, "closeAutoFlash fail", e)
+        }
+    }
+
+    // -------------------------------
+    // Utilities: Bitmap <-> YUV, save file, convert ImageProxy
+    // -------------------------------
+    private fun imageProxyToBitmap(image: ImageProxy): Bitmap? {
+        try {
+            val format = image.format
+            // Use YUV_420_888 -> NV21 conversion
+            if (format == ImageFormat.YUV_420_888) {
+                val yBuffer = image.planes[0].buffer
+                val uBuffer = image.planes[1].buffer
+                val vBuffer = image.planes[2].buffer
+                val ySize = yBuffer.remaining()
+                val uSize = uBuffer.remaining()
+                val vSize = vBuffer.remaining()
+                val nv21 = ByteArray(ySize + uSize + vSize)
+                yBuffer.get(nv21, 0, ySize)
+
+                // interleave VU
+                val uBytes = ByteArray(uSize)
+                val vBytes = ByteArray(vSize)
+                uBuffer.get(uBytes)
+                vBuffer.get(vBytes)
+                var offset = ySize
+                var i = 0
+                while (i < uBytes.size && offset + 1 < nv21.size) {
+                    nv21[offset++] = vBytes[i]
+                    nv21[offset++] = uBytes[i]
+                    i++
+                }
+                val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
+                val out = ByteArrayOutputStream()
+                yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), 80, out)
+                val imageBytes = out.toByteArray()
+                return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+            } else {
+                // fallback: try plane0 as JPEG
+                val buffer = image.planes[0].buffer
+                val bytes = ByteArray(buffer.remaining())
+                buffer.get(bytes)
+                return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "imageProxyToBitmap fail", e)
+            return null
+        }
+    }
+
+    private fun bitmapToYuvByteArray(bitmap: Bitmap): ByteArray {
+        // Simple conversion: compress to JPEG then decode to YUV is expensive;
+        // But PaDetectorManager.do18QualityInspectionForLight in Java accepted yuvData byte[] - this is a best-effort approximation.
+        val out = ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 90, out)
+        return out.toByteArray()
+    }
+
+    private fun saveBitmapToCache(bitmap: Bitmap, name: String): String {
+        val dir = File(cacheDir, "detect_images")
+        if (!dir.exists()) dir.mkdirs()
+        val fileName = if (name.contains(File.separator)) name.substringAfterLast(File.separator) else name
+        val file = File(dir, fileName)
+        var fos: FileOutputStream? = null
+        try {
+            fos = FileOutputStream(file)
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 90, fos)
+            fos.flush()
+        } finally {
+            fos?.close()
+        }
+        return file.absolutePath
+    }
+
+    private fun saveBitmapToFile(bitmap: Bitmap, path: String) {
+        val file = File(path)
+        file.parentFile?.mkdirs()
+        var fos: FileOutputStream? = null
+        try {
+            fos = FileOutputStream(file)
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 90, fos)
+            fos.flush()
+        } finally {
+            fos?.close()
+        }
+    }
+
+    // -------------------------------
+    // getPhotoFrameVertices: same algorithm and order (leftTop, rightTop, rightBottom, leftBottom)
+    // -------------------------------
+    private fun getPhotoFrameVertices(previewViewSize: Point, isScreenLandscape: Boolean, density: Float): Array<Point> {
+        val photoFrameWidthTop = if (isScreenLandscape) SCREEN_RECT_WIDTH_FINAL_LANDSCAPE else SCREEN_RECT_WIDTH_FINAL_PORTRAIT
+        val photoFrameWidthBottom = photoFrameWidthTop
+        val photoFrameHeight = if (isScreenLandscape) SCREEN_RECT_HEIGHT_FINAL_LANDSCAPE else SCREEN_RECT_HEIGHT_FINAL_PORTRAIT
+
+        val frameWidthPx = dpToPx(photoFrameWidthTop.toFloat(), density).toInt()
+        val frameHeightPx = dpToPx(photoFrameHeight.toFloat(), density).toInt()
+
+        val previewWidth = previewViewSize.x
+        val previewHeight = if (isScreenLandscape) previewViewSize.y else previewViewSize.y * 9 / 10
+
+        val x1 = previewWidth / 2 - frameWidthPx / 2
+        val y1 = previewHeight / 2 - frameHeightPx / 2
+        val x2 = previewWidth / 2 + frameWidthPx / 2
+        val y2 = y1
+        val x3 = x2
+        val y3 = previewHeight / 2 + frameHeightPx / 2
+        val x4 = x1
+        val y4 = y3
+
+        return arrayOf(Point(x1, y1), Point(x2, y2), Point(x3, y3), Point(x4, y4))
+    }
+
+    private fun dpToPx(dp: Float, density: Float): Float = dp * density
+
+    // -------------------------------
+    // reset detection (like Java resetIdCardDetect)
+    // -------------------------------
+    private fun resetIdCardDetect() {
+        photoIndex = 0
+        idCardTypeResult = IdCardType.ERROR_INVALID_ID_CARD
+        startCaptureTime = 0
+        qualityPassed = false
+        openLightTime = 0
+        normalFlashFilePaths.clear()
+        normalFlashEdgeResult.clear()
+        lightCaptureProgressCount.set(0)
+        mDetectImgDirName = null
+        needGetPreviewFrame = true
+        isOperatingPicture = false
+    }
+
+    // -------------------------------
+    // vibrate helpers
+    // -------------------------------
+    @SuppressLint("MissingPermission")
+    private fun vibrate() {
+        vibrator?.vibrate(500)
+    }
+
+    private fun cancelVibrate() {
+        vibrator?.cancel()
+    }
+
+    private fun checkVibrate() {
+        runOnUiThread {
+            if (photoIndex != 0) vibrate()
+        }
+    }
+
+    // -------------------------------
+    // stub for VerticesDetectionResultNew.cardType mapping (we used in Java)
+    // If your SDK exposes VerticesDetectionResultNew class, remove this stub and use real class.
+    // -------------------------------
+    private object VerticesDetectionResultStub {
+        const val EDGE_TYPE_OTHER = 1
+    }
+}
