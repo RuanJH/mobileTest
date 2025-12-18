@@ -1,0 +1,218 @@
+package com.your.package
+
+import android.app.Application
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Point
+import android.util.Log
+import androidx.camera.core.Camera
+import androidx.camera.core.CameraControl
+import androidx.camera.core.ImageProxy
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.pingan.idverify.bean.*
+import com.pingan.idverify.detector.PaDetectorManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import java.io.File
+import java.util.*
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+import com.pa.cardcheck.bean.CardResult
+
+class Camera18ViewModel(
+    application: Application,
+    private val onFinished: (CardResult) -> Unit,
+    private val onHint: (String) -> Unit
+) : AndroidViewModel(application) {
+
+    companion object {
+        const val TAG = "Camera18ViewModel"
+        const val ANALYSIS_WIDTH = 1280
+        const val ANALYSIS_HEIGHT = 720
+        const val LIGHT_CAPTURE_MAX_COUNT = 30
+    }
+
+    private var cameraControl: CameraControl? = null
+    fun bindCamera(camera: Camera) {
+        cameraControl = camera.cameraControl
+    }
+
+    private val executor = Executors.newSingleThreadExecutor()
+
+    private var previewSize = Point(ANALYSIS_WIDTH, ANALYSIS_HEIGHT)
+    private lateinit var bitmapVertices: Array<Point>
+
+    private var needGetPreviewFrame = false
+    private var isOperating = false
+    private var frameCount = 0L
+    private var photoIndex = 0
+    private var qualityPassed = false
+
+    private val framePaths = Collections.synchronizedList(mutableListOf<Pair<String, Float>>())
+    private val edgeResults = mutableListOf<Int>()
+    private val progress = AtomicInteger(0)
+
+    private var openLightTime = 0L
+    private var startCaptureTime = 0L
+
+    private val intervalOpenToCapture = 200L
+    private val intervalCaptureEnd = 700L
+    private val intervalCloseLight = 600L
+
+    private val lightThresholds = floatArrayOf(100f, 220f)
+
+    private var detectDir: String? = null
+
+    fun startDetection(bitmapVertices: Array<Point>) {
+        this.bitmapVertices = bitmapVertices
+        needGetPreviewFrame = true
+        photoIndex = 0
+        qualityPassed = false
+        framePaths.clear()
+        edgeResults.clear()
+    }
+
+    fun onImageProxy(image: ImageProxy) {
+        if (!needGetPreviewFrame || isOperating) {
+            image.close()
+            return
+        }
+
+        frameCount++
+        if (frameCount < 10) {
+            image.close()
+            return
+        }
+
+        isOperating = true
+        executor.execute {
+            try {
+                val nv21 = CameraXHelper.imageProxyToNv21(image)
+                var bmp = CameraXHelper.nv21ToBitmap(nv21, image.width, image.height)
+                bmp = CameraXHelper.rotateBitmap(bmp, image.imageInfo.rotationDegrees)
+
+                if (detectDir == null) {
+                    detectDir = "${Date().time}${File.separator}"
+                }
+
+                if (photoIndex == 0) {
+                    val type = PaDetectorManager.getIdCardType(
+                        getApplication(),
+                        bmp,
+                        previewSize,
+                        bitmapVertices
+                    ).result
+
+                    if (type != IdCardType.ID_CARD_TYPE_18) {
+                        onHint("未检测到 18 版身份证")
+                        return@execute
+                    }
+
+                    val quality = PaDetectorManager.do18QualityInspection(
+                        getApplication(),
+                        bmp,
+                        previewSize,
+                        bitmapVertices,
+                        QualityInspectionOptionParams()
+                    )
+
+                    if (quality.result != QualityInspectionResult.SUCCESS) {
+                        onHint("质量不通过")
+                        return@execute
+                    }
+
+                    openFlash()
+                    openLightTime = System.currentTimeMillis()
+                    photoIndex++
+                    onHint("开启闪光灯")
+                } else {
+                    val now = System.currentTimeMillis()
+
+                    if (!qualityPassed && now - openLightTime > intervalOpenToCapture) {
+                        val q = PaDetectorManager.do18QualityInspectionForLight(
+                            getApplication(),
+                            nv21,
+                            image.width,
+                            image.height,
+                            0,
+                            previewSize,
+                            bitmapVertices,
+                            lightThresholds,
+                            true
+                        )
+                        if (q.result == QualityInspectionResult.SUCCESS) {
+                            qualityPassed = true
+                            startCaptureTime = now
+                            onHint("开始抓拍")
+                        }
+                    }
+
+                    if (qualityPassed) {
+                        val q = PaDetectorManager.do18QualityInspectionForLight(
+                            getApplication(),
+                            nv21,
+                            image.width,
+                            image.height,
+                            0,
+                            previewSize,
+                            bitmapVertices,
+                            lightThresholds,
+                            false
+                        )
+
+                        q.cutOutBitmap?.let {
+                            val path = CameraXHelper.saveBitmapToFile(
+                                getApplication<Application>().cacheDir,
+                                "${detectDir}${now}.jpg",
+                                it
+                            )
+                            framePaths.add(path to q.score)
+                        }
+                    }
+
+                    if (framePaths.size >= LIGHT_CAPTURE_MAX_COUNT ||
+                        now - startCaptureTime > intervalCaptureEnd
+                    ) {
+                        closeFlash()
+                        processFrames()
+                        needGetPreviewFrame = false
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "process error", e)
+            } finally {
+                isOperating = false
+                image.close()
+            }
+        }
+    }
+
+    private fun processFrames() {
+        if (framePaths.size < 2) {
+            onHint("有效照片不足")
+            return
+        }
+
+        framePaths.sortBy { it.second }
+        val bmp1 = BitmapFactory.decodeFile(framePaths.first().first)
+        val bmp2 = BitmapFactory.decodeFile(framePaths[framePaths.size / 2].first)
+
+        val result = PaDetectorManager.do18Identification(
+            getApplication(),
+            arrayOf(bmp1, bmp2, bmp1)
+        )
+
+        val cardResult = CardResult()
+        cardResult.allPassed = result.isSuccess
+        onFinished(cardResult)
+    }
+
+    private fun openFlash() {
+        cameraControl?.enableTorch(true)
+    }
+
+    private fun closeFlash() {
+        cameraControl?.enableTorch(false)
+    }
+}
