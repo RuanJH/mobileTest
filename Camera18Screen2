@@ -1,0 +1,88 @@
+package com.your.package
+
+import android.graphics.Point
+import android.util.Size
+import android.view.ViewGroup
+import androidx.camera.core.*
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.viewmodel.compose.viewModel
+import java.util.concurrent.Executors
+
+@Composable
+fun Camera18Screen(
+    onFinished: (com.pa.cardcheck.bean.CardResult) -> Unit,
+    onHint: (String) -> Unit
+) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val lifecycle = androidx.compose.ui.platform.LocalLifecycleOwner.current
+
+    val vm: Camera18ViewModel = viewModel {
+        Camera18ViewModel(context.applicationContext as android.app.Application, onFinished, onHint)
+    }
+
+    AndroidView(
+        modifier = Modifier,
+        factory = {
+            PreviewView(it).apply {
+                layoutParams = ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+            }
+        },
+        update = { previewView ->
+            previewView.post {
+                val provider = ProcessCameraProvider.getInstance(context).get()
+
+                val preview = Preview.Builder()
+                    .setTargetResolution(Size(1280, 720))
+                    .build()
+
+                val analysis = ImageAnalysis.Builder()
+                    .setTargetResolution(Size(1280, 720))
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .build()
+
+                analysis.setAnalyzer(
+                    Executors.newSingleThreadExecutor()
+                ) { image ->
+                    vm.onImageProxy(image)
+                }
+
+                provider.unbindAll()
+                val camera = provider.bindToLifecycle(
+                    lifecycle,
+                    CameraSelector.DEFAULT_BACK_CAMERA,
+                    preview,
+                    analysis
+                )
+
+                vm.bindCamera(camera)
+                preview.setSurfaceProvider(previewView.surfaceProvider)
+
+                // 屏幕坐标识别框
+                val fw = previewView.width * 0.7f
+                val fh = fw * 0.63f
+                val l = ((previewView.width - fw) / 2).toInt()
+                val t = ((previewView.height - fh) / 2).toInt()
+
+                // 映射到 Bitmap 坐标（关键）
+                val scaleX = Camera18ViewModel.ANALYSIS_WIDTH / previewView.width.toFloat()
+                val scaleY = Camera18ViewModel.ANALYSIS_HEIGHT / previewView.height.toFloat()
+
+                val bitmapVertices = arrayOf(
+                    Point((l * scaleX).toInt(), (t * scaleY).toInt()),
+                    Point(((l + fw) * scaleX).toInt(), (t * scaleY).toInt()),
+                    Point(((l + fw) * scaleX).toInt(), ((t + fh) * scaleY).toInt()),
+                    Point((l * scaleX).toInt(), ((t + fh) * scaleY).toInt())
+                )
+
+                vm.startDetection(bitmapVertices)
+            }
+        }
+    )
+}
