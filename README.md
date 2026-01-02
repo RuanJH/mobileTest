@@ -1,3 +1,40 @@
+private fun imageProxyToBitmap(image: ImageProxy): Bitmap {
+    val yBuffer = image.planes[0].buffer
+    val uBuffer = image.planes[1].buffer
+    val vBuffer = image.planes[2].buffer
+
+    val ySize = yBuffer.remaining()
+    val uSize = uBuffer.remaining()
+    val vSize = vBuffer.remaining()
+
+    val nv21 = ByteArray(ySize + uSize + vSize)
+
+    yBuffer.get(nv21, 0, ySize)
+    vBuffer.get(nv21, ySize, vSize)
+    uBuffer.get(nv21, ySize + vSize, uSize)
+
+    val yuvImage = YuvImage(
+        nv21,
+        ImageFormat.NV21,
+        image.width,
+        image.height,
+        null
+    )
+
+    val out = ByteArrayOutputStream()
+    yuvImage.compressToJpeg(
+        image.cropRect,
+        100,
+        out
+    )
+
+    val bmp = BitmapFactory.decodeByteArray(out.toByteArray(), 0, out.size())
+    return rotateBitmap(bmp, image.imageInfo.rotationDegrees)
+}
+
+
+
+
 What You CAN Do (UI/UX Customization Supported by Onfido Android SDK)
 1. Apply custom themes
 
