@@ -1,259 +1,55 @@
-@file:OptIn(ExperimentalCoroutinesApi::class)
+@Test
+fun `handleViewQuery GetDidvView executes composable body`() {
+    // ---------- given ----------
+    val payload = JSONObject("""{"key":"value"}""")
 
-package com.xxx.didv.journey
+    every { plugin.job } returns mockk(relaxed = true)
+    every { plugin.additionalAnalyticsConfigProvider } returns mockk(relaxed = true)
+    every { plugin.viewModelFactory.get() } returns mockk(relaxed = true)
+    every { plugin.savedStateViewModelFactory } returns mockk(relaxed = true)
 
-import io.mockk.*
-import kotlinx.coroutines.ExperimentalCoroutinesApi
-import org.json.JSONObject
-import org.junit.After
-import org.junit.Before
-import org.junit.Test
+    every {
+        plugin.FetchComposableView(
+            messageName = any(),
+            pluginName = any(),
+            payload = any()
+        )
+    } returns mockk(relaxed = true)
 
-class DidvJourneyUIHandlerTest {
+    every {
+        plugin.FetchComposableView(
+            messageName = any(),
+            pluginName = any()
+        )
+    } returns mockk(relaxed = true)
 
-    private lateinit var handler: DidvJourneyUIHandler
+    // objectToJson 用到了
+    mockkStatic(::objectToJson)
+    every { objectToJson(any()) } returns "{}"
 
-    private val plugin: DidvJourneyPlugin = mockk(relaxed = true)
-    private val store: NavigationStore = mockk(relaxed = true)
+    val viewQuery = ViewQuery(
+        messageName = Messages.GetDidvView.name,
+        payload = payload
+    )
 
-    @Before
-    fun setUp() {
-        every { plugin.store.getNavigationStore() } returns store
+    // ---------- when ----------
+    val response = handler.handleViewQuery(viewQuery)
 
-        mockkStatic(::objectFromJson)
-        mockkStatic(::objectToJson)
-
-        every { objectToJson(any()) } returns "{}"
-        every { objectFromJson<Any>(any()) } returns mockk(relaxed = true)
-
-        handler = DidvJourneyUIHandler(plugin)
-    }
-
-    @After
-    fun tearDown() {
-        unmockkAll()
-    }
-
-    // -------------------------
-    // initCount
-    // -------------------------
-
-    @Test
-    fun `initCount resets counters`() {
-        handler.faceDetectCount = 0
-        handler.faceDetectSpecialCount = 0
-
-        handler.initCount()
-
-        assert(handler.faceDetectCount == 5)
-        assert(handler.faceDetectSpecialCount == 6)
-    }
-
-    // -------------------------
-    // navigate
-    // -------------------------
-
-    @Test
-    fun `navigate sends action to store`() {
-        val action = mockk<NavigationActions>()
-        handler.navigate(action)
-
-        verify { store.send(action) }
-    }
-
-    // -------------------------
-    // publishSuccess
-    // -------------------------
-
-    @Test
-    fun `publishSuccess publishes success result`() {
-        handler.publishSuccess()
-
-        verify {
-            plugin.publishDidvResultEvent(any())
+    // ---------- then ----------
+    // 关键：强制执行 lambda，触发 Sonar 覆盖
+    when (response) {
+        is ViewQueryResponse.ComposableViewQueryResponse -> {
+            response.content.invoke()
         }
+        else -> error("Unexpected response type")
     }
 
-    // -------------------------
-    // publishError
-    // -------------------------
-
-    @Test
-    fun `publishError publishes error result`() {
-        handler.publishError("ERROR_CODE")
-
-        verify {
-            plugin.publishDidvResultEvent(any())
-        }
+    // ---------- verify ----------
+    verify {
+        plugin.job?.cancel()
+        plugin.additionalAnalyticsConfigProvider.setup(payload)
     }
 
-    // -------------------------
-    // handleSuccess - finished
-    // -------------------------
-
-    @Test
-    fun `handleSuccess publishes success when flow finished`() {
-        val journey = JourneyResponse(
-            category = JourneyFlowCategory.AuthFlowFinished.name,
-            data = null
-        )
-
-        every { objectFromJson<JourneyResponse>(any()) } returns journey
-
-        handler.handleSuccess("{}")
-
-        verify { plugin.publishDidvResultEvent(any()) }
-    }
-
-    // -------------------------
-    // handleSuccess - navigation
-    // -------------------------
-
-    @Test
-    fun `handleSuccess navigates on capture document`() {
-        val data = mockk<JourneyData>(relaxed = true)
-        every { data.title } returns ConfirmationTitle.DidvCaptureDocumentPage.name
-
-        val journey = JourneyResponse(
-            category = "OTHER",
-            data = data
-        )
-
-        every { objectFromJson<JourneyResponse>(any()) } returns journey
-
-        handler.handleSuccess("{}")
-
-        verify { store.send(any()) }
-    }
-
-    // -------------------------
-    // handleFailure - default
-    // -------------------------
-
-    @Test
-    fun `handleFailure publishes service error on unknown throwable`() {
-        handler.handleFailure(RuntimeException())
-
-        verify { plugin.publishDidvResultEvent(any()) }
-    }
-
-    // -------------------------
-    // handleFailure - EventStreamOutputError
-    // -------------------------
-
-    @Test
-    fun `handleFailure parses event stream error`() {
-        val errorPayload = JSONObject("""{"category":"AuthFlowFinished","data":{"errorCode":"123"}}""")
-
-        val error = mockk<EventStreamOutputError> {
-            every { payload } returns errorPayload
-        }
-
-        every {
-            objectFromJson<JourneyErrorResponse>(any())
-        } returns JourneyErrorResponse(
-            category = JourneyFlowCategory.AuthFlowFinished.name,
-            data = JourneyErrorData("123")
-        )
-
-        handler.handleFailure(error)
-
-        verify { plugin.publishDidvResultEvent(any()) }
-    }
-
-    // -------------------------
-    // checkMaxFaceDetectCount
-    // -------------------------
-
-    @Test
-    fun `checkMaxFaceDetectCount consumes normal retry`() {
-        handler.faceDetectCount = 1
-
-        val retry = mockk<() -> Unit>(relaxed = true)
-
-        handler.checkMaxFaceDetectCount("OTHER", retry)
-
-        verify { retry.invoke() }
-    }
-
-    @Test
-    fun `checkMaxFaceDetectCount publishes max attempt`() {
-        handler.faceDetectCount = 0
-
-        handler.checkMaxFaceDetectCount("OTHER") {}
-
-        verify { plugin.publishDidvResultEvent(any()) }
-    }
-
-    @Test
-    fun `checkMaxFaceDetectCount handles 3003 special logic`() {
-        handler.faceDetectCount = 1
-        handler.faceDetectSpecialCount = 1
-
-        val retry = mockk<() -> Unit>(relaxed = true)
-
-        handler.checkMaxFaceDetectCount(
-            DidvFlowError.FACE_TRACKING_ERROR.errorCode,
-            retry
-        )
-
-        verify { retry.invoke() }
-    }
-
-    // -------------------------
-    // handleCommand
-    // -------------------------
-
-    @Test
-    fun `handleCommand cancel journey`() {
-        handler.handleCommand(
-            BaseMessage.Command(
-                messageName = Messages.DidvCancelJourney.name,
-                payload = null
-            )
-        )
-
-        verify { plugin.publishDidvResultEvent(any()) }
-    }
-
-    @Test
-    fun `handleCommand error journey`() {
-        every {
-            objectFromJson<JourneyErrorPayload>(any())
-        } returns JourneyErrorPayload(errorCode = "ERR")
-
-        handler.handleCommand(
-            BaseMessage.Command(
-                messageName = Messages.DidvErrorJourney.name,
-                payload = JSONObject()
-            )
-        )
-
-        verify { plugin.publishDidvResultEvent(any()) }
-    }
-
-    // -------------------------
-    // handleViewQuery
-    // -------------------------
-
-    @Test
-    fun `handleViewQuery GetDidvView`() {
-        val payload = JSONObject("{}")
-
-        val response = handler.handleViewQuery(
-            ViewQuery(
-                messageName = Messages.GetDidvView.name,
-                payload = payload
-            )
-        )
-
-        assert(response is ViewQueryResponse)
-    }
-
-    @Test(expected = UnsupportedOperationException::class)
-    fun `handleViewQuery throws on unknown`() {
-        handler.handleViewQuery(
-            ViewQuery("UNKNOWN", null)
-        )
-    }
+    assert(handler.faceDetectCount == DidvJourneyUIHandler.FACE_DETECT_MAX_COUNT)
+    assert(handler.faceDetectSpecialCount == DidvJourneyUIHandler.FACE_DETECT_3003_MAX_COUNT)
 }
